@@ -343,7 +343,7 @@ void run_all_tests(const std::string& test_name = "") {
     const int num_cu = props.multiProcessorCount;
 
     printf("=== GPU Memory Bandwidth Benchmark Suite ===\n");
-    printf("GPU: %s, CUs: %d, Block: %d, Unroll: %d, OCCUPANCY_PER_CU: %d\n\n",
+    printf("GPU: %s, CUs: %d, BlockSize: %d, Unroll: %d, OCCUPANCY_PER_CU: %d\n\n",
            props.name, num_cu, BLOCK_SIZE, UNROLL_FACTOR, OCCUPANCY_PER_CU);
 
     std::vector<int64_t> data_sizes = {

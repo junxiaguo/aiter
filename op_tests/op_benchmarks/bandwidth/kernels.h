@@ -145,7 +145,7 @@ __device__ __forceinline__ void do_lds_write(unsigned int offset, float2 reg) { 
 
 
 
-// WORKAROUND: Decompose 128-bit write into two 64-bit writes to avoid compiler issues.
+// TODO:x4 store instruction not supported yet
 __device__ __forceinline__ void do_lds_write(unsigned int offset, float4 reg){
     asm volatile("ds_write_b64 %0, %1" : : "v"(offset), "v"(*(float2*)&reg) : "memory");
     asm volatile("ds_write_b64 %0, %1" : : "v"(offset + 8), "v"(*((float2*)&reg + 1)) : "memory");
