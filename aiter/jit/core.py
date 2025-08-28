@@ -152,13 +152,13 @@ def validate_and_update_archs():
 
 
 @functools.lru_cache()
-def hip_flag_checker(flag_hip: str):
+def hip_flag_checker(flag_hip: str) -> bool:
     ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
-        return [flag_hip]
+        return True
     else:
         logger.warning(f"{flag_hip} is not supported by hipcc.")
-        return []
+        return False
 
 
 def check_and_set_ninja_worker():
@@ -404,8 +404,8 @@ def build_module(
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
-        except:
-            tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
+        except Exception as e:
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
             logger.error(
                 f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
                     re.sub(
@@ -416,7 +416,9 @@ def build_module(
                     ),
                 )
             )
-            raise
+            raise SystemExit(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from e
 
     def FinalFunc():
         logger.info(
@@ -516,6 +518,7 @@ MANUAL_SCHEMA_OPS = [
     "fmha_v3_bwd",
     "mha_varlen_bwd",
     "fmha_v3_varlen_bwd",
+    "fmha_v3_varlen_fwd",
     "mha_batch_prefill",
     "hipb_findallsols",
     "rocb_findallsols",
@@ -553,6 +556,8 @@ SPECIAL_OPS_MUTATES_ARGS = {
     "grouped_topk": ["topk_weights", "topk_ids"],
     "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
     "rotary_embedding_fwd": ["query", "key"],
+    "reshape_and_cache": ["key_cache", "value_cache"],
+    "reshape_and_cache_with_pertoken_quant": ["key_cache", "value_cache"],
 }
 
 
@@ -640,6 +645,19 @@ def generate_schema(func) -> str:
         and get_args(return_annotation)[0] is torch.Tensor
     ):
         return_type = "Tensor[]"
+    elif get_origin(return_annotation) is tuple:
+        args = get_args(return_annotation)
+        type_strings = []
+        for arg in args:
+            if arg is torch.Tensor:
+                type_strings.append("Tensor")
+            elif arg is int:
+                type_strings.append("int")
+            elif arg is float:
+                type_strings.append("float")
+            elif arg is bool:
+                type_strings.append("bool")
+        return_type = f"({', '.join(type_strings)})"
     else:
         return_type = "Any"
 
@@ -654,7 +672,6 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
 ):
-
     def decorator(func):
         func.arg_checked = False
 
