@@ -843,7 +843,7 @@ def main():
 _QH128_ASM = {1: mla_decode_fwd_ps1_qh128_asm, 64: mla_decode_fwd_ps64_qh128_asm}
 
 
-def _make_qh128_case(lengths, stride=576, page_size=64):
+def _make_qh128_case(lengths, stride=576, page_size=64, scale_values=(0.75, 1.25)):
     generator = torch.Generator().manual_seed(19)
     batch = len(lengths)
     counts = [(n + page_size - 1) // page_size for n in lengths]
@@ -869,8 +869,9 @@ def _make_qh128_case(lengths, stride=576, page_size=64):
         (batch * 128 + 32,), float("nan"), dtype=torch.float32, device="cuda"
     )
     lse = raw_lse[16:-16].view(batch, 128)
+    # Allocate scales once during setup; every eager/graph launch reuses them.
     scales = [
-        torch.tensor([v], dtype=torch.float32, device="cuda") for v in [0.75, 1.25]
+        torch.tensor([v], dtype=torch.float32, device="cuda") for v in scale_values
     ]
     if page_size == 1:
         cache = kv.view(pages, 1, 1, 576)
@@ -901,8 +902,8 @@ def _make_qh128_case(lengths, stride=576, page_size=64):
 def _ref_qh128_case(case):
     args, _, _, q, kv, table, lengths = case
     page_size = kv.shape[1]
-    q_scale = 1.0 if args[5] is None else args[5].cpu().item()
-    kv_scale = 1.0 if args[6] is None else args[6].cpu().item()
+    q_scale = args[5].cpu().item()
+    kv_scale = args[6].cpu().item()
     outputs = torch.zeros(len(lengths), 128, 512)
     lse = torch.full((len(lengths), 128), -float("inf"))
     for row, length in enumerate(lengths):
@@ -959,8 +960,11 @@ class TestMlaQh128:
             torch.testing.assert_close(args[4], previous, atol=0, rtol=0)
 
     @pytest.mark.parametrize("page_size", [1, 64])
-    def test_stream_graph_and_dynamic_metadata(self, page_size):
-        case = _make_qh128_case([65, 321], page_size=page_size)
+    @pytest.mark.parametrize("scale_values", [(1.0, 1.0), (0.75, 1.25)])
+    def test_stream_graph_and_dynamic_metadata(self, page_size, scale_values):
+        case = _make_qh128_case(
+            [65, 321], page_size=page_size, scale_values=scale_values
+        )
         args, lse, *_ = case
         launch = _QH128_ASM[page_size]
         launch(*args, lse=lse)
@@ -1036,87 +1040,24 @@ class TestMlaQh128:
 
     @pytest.mark.parametrize("page_size", [1, 64])
     def test_shared_pages_and_unit_scales(self, page_size):
-        case = _make_qh128_case([65, 65], page_size=page_size)
+        case = _make_qh128_case([65, 65], page_size=page_size, scale_values=(1.0, 1.0))
         args, lse, _, _, _, table, _ = case
         table[1].copy_(table[0])
         if page_size == 1:
             args[3][65:130].copy_(args[3][:65])
         else:
             args[3][1].copy_(args[3][0])
-        args[5] = args[6] = None
         _QH128_ASM[page_size](*args, lse=lse)
         _check_qh128_case(case)
 
     @pytest.mark.parametrize("page_size", [1, 64])
     @pytest.mark.parametrize("missing_scales", [(5,), (6,), (5, 6)])
-    def test_first_unit_scale_capture_then_eager(
-        self, page_size, missing_scales, monkeypatch
-    ):
-        case = _make_qh128_case([65, 129], page_size=page_size)
-        args, lse, *_ = case
-        launch = _QH128_ASM[page_size]
-        # Compile/load the native module using explicit scales. The first
-        # omitted-scale call below must occur inside capture.
-        launch(*args, lse=lse)
-        torch.cuda.synchronize()
-        aiter.mla._mla_qh128_unit_scales.clear()
+    def test_requires_explicit_scales(self, page_size, missing_scales):
+        args, lse, *_ = _make_qh128_case([65], page_size=page_size)
         for index in missing_scales:
             args[index] = None
-        captured_scales = []
-        ones = torch.ones
-
-        def track_ones(*args, **kwargs):
-            scale = ones(*args, **kwargs)
-            if torch.cuda.is_current_stream_capturing():
-                captured_scales.append(scale)
-            return scale
-
-        graph = torch.cuda.CUDAGraph()
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "ones", track_ones)
-            with torch.cuda.graph(graph):
-                launch(*args, lse=lse)
-        assert captured_scales
-        # A captured fill has not run yet. Poison its allocation to make eager
-        # reuse fail deterministically instead of relying on allocator contents.
-        for scale in captured_scales:
-            scale.fill_(float("nan"))
-        launch(*args, lse=lse)
-        _check_qh128_case(case)
-        graph.replay()
-        torch.cuda.synchronize()
-        _check_qh128_case(case)
-
-    @pytest.mark.parametrize("page_size", [1, 64])
-    def test_warm_unit_scale_reused_on_another_stream_and_graph(
-        self, page_size, monkeypatch
-    ):
-        case = _make_qh128_case([65, 129], page_size=page_size)
-        args, lse, *_ = case
-        launch = _QH128_ASM[page_size]
-        launch(*args, lse=lse)
-        torch.cuda.synchronize()
-        aiter.mla._mla_qh128_unit_scales.clear()
-        args[5] = args[6] = None
-        # Initialize on a different stream. The published scalar is already
-        # ready for the main stream without a caller-supplied wait.
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            aiter.mla._mla_qh128_unit_scale(args[0].device)
-
-        def unexpected_ones(*args, **kwargs):
-            raise AssertionError("a warmed unit scale must not allocate or fill again")
-
-        graph = torch.cuda.CUDAGraph()
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "ones", unexpected_ones)
-            launch(*args, lse=lse)
-            _check_qh128_case(case)
-            with torch.cuda.graph(graph):
-                launch(*args, lse=lse)
-        graph.replay()
-        torch.cuda.synchronize()
-        _check_qh128_case(case)
+        with pytest.raises(ValueError, match="q_scale and kv_scale are required"):
+            _QH128_ASM[page_size](*args, lse=lse)
 
     @staticmethod
     def _require_large_address_memory(nbytes):

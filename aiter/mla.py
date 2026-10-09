@@ -5,7 +5,6 @@
 
 import functools
 import os
-import threading
 from typing import NamedTuple
 
 import torch
@@ -633,37 +632,14 @@ def mla_decode_fwd_ds32(
     return o, (final_lse if return_lse else None)
 
 
-_mla_qh128_unit_scales: dict[torch.device, torch.Tensor] = {}
-_mla_qh128_unit_scale_lock = threading.Lock()
-
-
-def _mla_qh128_unit_scale(device):
-    """Reuse initialized eager scalars; keep capture-only allocations local."""
-    scale = _mla_qh128_unit_scales.get(device)
-    if scale is not None:
-        return scale
-    with _mla_qh128_unit_scale_lock:
-        scale = _mla_qh128_unit_scales.get(device)
-        if scale is None:
-            with torch.cuda.device(device):
-                scale = torch.ones(1, dtype=torch.float32, device=device)
-                if not torch.cuda.is_current_stream_capturing():
-                    # Publish only after the fill completes, so another stream
-                    # can reuse it without a dependency or record_stream call.
-                    torch.cuda.current_stream(device).synchronize()
-                    _mla_qh128_unit_scales[device] = scale
-                # A captured fill runs on replay. Its graph-pool allocation
-                # must not escape into the cache used by eager calls.
-    return scale
-
-
 def _mla_decode_fwd_qh128_asm(
     launch, q, kv, metadata, indices, out, lse, q_scale, kv_scale, softmax_scale
 ):
     if q_scale is None or kv_scale is None:
-        unit_scale = _mla_qh128_unit_scale(q.device)
-        q_scale = unit_scale if q_scale is None else q_scale
-        kv_scale = unit_scale if kv_scale is None else kv_scale
+        raise ValueError(
+            "q_scale and kv_scale are required; create and reuse FP32 [1] "
+            "tensors containing 1.0 for unit scales"
+        )
     launch(q, kv, metadata, indices, out, lse, q_scale, kv_scale, float(softmax_scale))
     return out
 
@@ -674,8 +650,8 @@ def mla_decode_fwd_ps1_qh128_asm(
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     out: torch.Tensor,
-    q_scale: torch.Tensor | None,
-    kv_scale: torch.Tensor | None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
     softmax_scale: float,
     lse: torch.Tensor,
 ) -> torch.Tensor:
@@ -689,12 +665,14 @@ def mla_decode_fwd_ps1_qh128_asm(
     valid physical token IDs in each used range. CSR contents are not checked
     on the host, so the launch does not synchronize GPU metadata to the CPU.
 
-    Scales are one FP32 scalar each, or None for 1. Used inputs/scales must be
-    finite. Empty sequences produce O=0, LSE=-inf. Unlike PS64, this CO always
-    writes LSE: supply a reusable contiguous FP32 [B,128] buffer even if LSE
-    is discarded.
+    q_scale and kv_scale are required GPU FP32 scalar tensors on Q's device.
+    For unit scales, create tensors containing 1.0 once during initialization,
+    before graph capture, and reuse them for each call. Used inputs/scales
+    must be finite. Empty sequences produce O=0, LSE=-inf. Unlike PS64, this
+    CO always writes LSE: supply a reusable contiguous FP32 [B,128] buffer
+    even if LSE is discarded.
     No split-K or partial logits. Warm up the native module on the target
-    device before graph capture; omitted scales are safe on first capture.
+    device before graph capture.
     The native launcher uses the Q device's current stream. Callers manage
     input/output lifetimes and dependencies when using multiple streams.
     """
@@ -723,8 +701,8 @@ def mla_decode_fwd_ps64_qh128_asm(
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
     out: torch.Tensor,
-    q_scale: torch.Tensor | None,
-    kv_scale: torch.Tensor | None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
     softmax_scale: float,
     lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -732,15 +710,18 @@ def mla_decode_fwd_ps64_qh128_asm(
 
     Q is [B,128,576] FP8 E4M3FN, with head stride 576 or 768 bytes. KV is
     contiguous Gluon-shuffled [pages,1,64,576]. seq_lens is int32 [B];
-    page_table is int32 [B,max_pages] with unit inner stride. Scales are one
-    FP32 scalar each, or None for 1. Used Q/KV/scales must be finite; unused
-    KV/page-table padding may be poisoned. Invalid lengths/page IDs produce
-    O=0 and LSE=-inf. Valid empty sequences have the same output convention.
+    page_table is int32 [B,max_pages] with unit inner stride. q_scale and
+    kv_scale are required GPU FP32 scalar tensors on Q's device. For unit
+    scales, create tensors containing 1.0 once during initialization, before
+    graph capture, and reuse them for each call. Used Q/KV/scales must be
+    finite; unused KV/page-table padding may be poisoned. Invalid lengths/page
+    IDs produce O=0 and LSE=-inf. Valid empty sequences have the same output
+    convention.
 
     Unlike PS1, this CO accepts a null LSE pointer, so lse may be omitted.
     No split-K or host metadata synchronization. Warm up the native module
-    on the target device before graph capture; omitted scales are safe on
-    first capture. The native launcher uses the Q device's current stream.
+    on the target device before graph capture. The native launcher uses the
+    Q device's current stream.
     Callers manage tensor lifetimes and dependencies across streams.
     """
     require_gfx1250_asm("mla_decode_fwd_ps64_qh128_asm")
