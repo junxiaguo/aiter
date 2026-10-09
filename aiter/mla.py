@@ -5,6 +5,7 @@
 
 import functools
 import os
+import threading
 from typing import NamedTuple
 
 import torch
@@ -632,10 +633,39 @@ def mla_decode_fwd_ds32(
     return o, (final_lse if return_lse else None)
 
 
-@functools.lru_cache(maxsize=16)
+_mla_qh128_unit_scales: dict[torch.device, torch.Tensor] = {}
+_mla_qh128_unit_scale_lock = threading.Lock()
+
+
 def _mla_qh128_unit_scale(device):
-    """Reuse a device-side FP32 one when a caller omits Q/KV descales."""
-    return torch.ones(1, dtype=torch.float32, device=device)
+    """Reuse initialized eager scalars; keep capture-only allocations local."""
+    scale = _mla_qh128_unit_scales.get(device)
+    if scale is not None:
+        return scale
+    with _mla_qh128_unit_scale_lock:
+        scale = _mla_qh128_unit_scales.get(device)
+        if scale is None:
+            with torch.cuda.device(device):
+                scale = torch.ones(1, dtype=torch.float32, device=device)
+                if not torch.cuda.is_current_stream_capturing():
+                    # Publish only after the fill completes, so another stream
+                    # can reuse it without a dependency or record_stream call.
+                    torch.cuda.current_stream(device).synchronize()
+                    _mla_qh128_unit_scales[device] = scale
+                # A captured fill runs on replay. Its graph-pool allocation
+                # must not escape into the cache used by eager calls.
+    return scale
+
+
+def _mla_decode_fwd_qh128_asm(
+    launch, q, kv, metadata, indices, out, lse, q_scale, kv_scale, softmax_scale
+):
+    if q_scale is None or kv_scale is None:
+        unit_scale = _mla_qh128_unit_scale(q.device)
+        q_scale = unit_scale if q_scale is None else q_scale
+        kv_scale = unit_scale if kv_scale is None else kv_scale
+    launch(q, kv, metadata, indices, out, lse, q_scale, kv_scale, float(softmax_scale))
+    return out
 
 
 def mla_decode_fwd_ps1_qh128_asm(
@@ -660,35 +690,31 @@ def mla_decode_fwd_ps1_qh128_asm(
     on the host, so the launch does not synchronize GPU metadata to the CPU.
 
     Scales are one FP32 scalar each, or None for 1. Used inputs/scales must be
-    finite. Empty sequences produce O=0, LSE=-inf. This CO always writes LSE:
-    supply a reusable contiguous FP32 [B,128] buffer even if LSE is discarded.
-    No split-K or partial logits. Warm up on the target device before graph
-    capture. The native launcher uses the current stream.
+    finite. Empty sequences produce O=0, LSE=-inf. Unlike PS64, this CO always
+    writes LSE: supply a reusable contiguous FP32 [B,128] buffer even if LSE
+    is discarded.
+    No split-K or partial logits. Warm up the native module on the target
+    device before graph capture; omitted scales are safe on first capture.
+    The native launcher uses the Q device's current stream. Callers manage
+    input/output lifetimes and dependencies when using multiple streams.
     """
     require_gfx1250_asm("mla_decode_fwd_ps1_qh128_asm")
     if lse is None:
         raise ValueError(
             "lse is required by the page1 kernel; supply an FP32 [B,128] buffer"
         )
-    with torch.cuda.device(q.device):
-        q_scale = _mla_qh128_unit_scale(q.device) if q_scale is None else q_scale
-        kv_scale = _mla_qh128_unit_scale(q.device) if kv_scale is None else kv_scale
-        mla_ps1_qh128_fp8_asm_fwd(
-            q,
-            kv,
-            kv_indptr,
-            kv_indices,
-            out,
-            lse,
-            q_scale,
-            kv_scale,
-            float(softmax_scale),
-        )
-        stream = torch.cuda.current_stream(q.device)
-        for tensor in (q, kv, kv_indptr, kv_indices, out, lse, q_scale, kv_scale):
-            if tensor is not None:
-                tensor.record_stream(stream)
-    return out
+    return _mla_decode_fwd_qh128_asm(
+        mla_ps1_qh128_fp8_asm_fwd,
+        q,
+        kv,
+        kv_indptr,
+        kv_indices,
+        out,
+        lse,
+        q_scale,
+        kv_scale,
+        softmax_scale,
+    )
 
 
 def mla_decode_fwd_ps64_qh128_asm(
@@ -711,29 +737,25 @@ def mla_decode_fwd_ps64_qh128_asm(
     KV/page-table padding may be poisoned. Invalid lengths/page IDs produce
     O=0 and LSE=-inf. Valid empty sequences have the same output convention.
 
-    No split-K or host metadata synchronization. Warm up on the target device
-    before graph capture. The native launcher uses the current stream.
+    Unlike PS1, this CO accepts a null LSE pointer, so lse may be omitted.
+    No split-K or host metadata synchronization. Warm up the native module
+    on the target device before graph capture; omitted scales are safe on
+    first capture. The native launcher uses the Q device's current stream.
+    Callers manage tensor lifetimes and dependencies across streams.
     """
     require_gfx1250_asm("mla_decode_fwd_ps64_qh128_asm")
-    with torch.cuda.device(q.device):
-        q_scale = _mla_qh128_unit_scale(q.device) if q_scale is None else q_scale
-        kv_scale = _mla_qh128_unit_scale(q.device) if kv_scale is None else kv_scale
-        mla_ps64_qh128_fp8_asm_fwd(
-            q,
-            kv,
-            seq_lens,
-            page_table,
-            out,
-            lse,
-            q_scale,
-            kv_scale,
-            float(softmax_scale),
-        )
-        stream = torch.cuda.current_stream(q.device)
-        for tensor in (q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale):
-            if tensor is not None:
-                tensor.record_stream(stream)
-    return out
+    return _mla_decode_fwd_qh128_asm(
+        mla_ps64_qh128_fp8_asm_fwd,
+        q,
+        kv,
+        seq_lens,
+        page_table,
+        out,
+        lse,
+        q_scale,
+        kv_scale,
+        softmax_scale,
+    )
 
 
 def mla_decode_fwd(

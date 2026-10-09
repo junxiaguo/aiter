@@ -1047,6 +1047,150 @@ class TestMlaQh128:
         _QH128_ASM[page_size](*args, lse=lse)
         _check_qh128_case(case)
 
+    @pytest.mark.parametrize("page_size", [1, 64])
+    @pytest.mark.parametrize("missing_scales", [(5,), (6,), (5, 6)])
+    def test_first_unit_scale_capture_then_eager(
+        self, page_size, missing_scales, monkeypatch
+    ):
+        case = _make_qh128_case([65, 129], page_size=page_size)
+        args, lse, *_ = case
+        launch = _QH128_ASM[page_size]
+        # Compile/load the native module using explicit scales. The first
+        # omitted-scale call below must occur inside capture.
+        launch(*args, lse=lse)
+        torch.cuda.synchronize()
+        aiter.mla._mla_qh128_unit_scales.clear()
+        for index in missing_scales:
+            args[index] = None
+        captured_scales = []
+        ones = torch.ones
+
+        def track_ones(*args, **kwargs):
+            scale = ones(*args, **kwargs)
+            if torch.cuda.is_current_stream_capturing():
+                captured_scales.append(scale)
+            return scale
+
+        graph = torch.cuda.CUDAGraph()
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "ones", track_ones)
+            with torch.cuda.graph(graph):
+                launch(*args, lse=lse)
+        assert captured_scales
+        # A captured fill has not run yet. Poison its allocation to make eager
+        # reuse fail deterministically instead of relying on allocator contents.
+        for scale in captured_scales:
+            scale.fill_(float("nan"))
+        launch(*args, lse=lse)
+        _check_qh128_case(case)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_qh128_case(case)
+
+    @pytest.mark.parametrize("page_size", [1, 64])
+    def test_warm_unit_scale_reused_on_another_stream_and_graph(
+        self, page_size, monkeypatch
+    ):
+        case = _make_qh128_case([65, 129], page_size=page_size)
+        args, lse, *_ = case
+        launch = _QH128_ASM[page_size]
+        launch(*args, lse=lse)
+        torch.cuda.synchronize()
+        aiter.mla._mla_qh128_unit_scales.clear()
+        args[5] = args[6] = None
+        # Initialize on a different stream. The published scalar is already
+        # ready for the main stream without a caller-supplied wait.
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            aiter.mla._mla_qh128_unit_scale(args[0].device)
+
+        def unexpected_ones(*args, **kwargs):
+            raise AssertionError("a warmed unit scale must not allocate or fill again")
+
+        graph = torch.cuda.CUDAGraph()
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "ones", unexpected_ones)
+            launch(*args, lse=lse)
+            _check_qh128_case(case)
+            with torch.cuda.graph(graph):
+                launch(*args, lse=lse)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_qh128_case(case)
+
+    @staticmethod
+    def _require_large_address_memory(nbytes):
+        torch.cuda.empty_cache()
+        if torch.cuda.mem_get_info()[0] < nbytes + (1 << 30):
+            pytest.skip("insufficient free memory for a >4 GiB address regression")
+
+    @pytest.mark.parametrize("page_size", [1, 64])
+    def test_q_and_out_beyond_4gib(self, page_size):
+        # Q's padded stride crosses 4 GiB at B=43691; O crosses it at B=32768.
+        batch = 48000
+        self._require_large_address_memory(batch * 128 * (768 + 512 * 2 + 4))
+        case = _make_qh128_case([65], stride=768, page_size=page_size)
+        args, lse, *_ = case
+        launch = _QH128_ASM[page_size]
+        launch(*args, lse=lse)
+        expected_out, expected_lse = args[4].clone(), lse.clone()
+        q = torch.zeros((batch, 128, 768), dtype=args[0].dtype, device="cuda")[
+            ..., :576
+        ]
+        q[-1:].copy_(args[0])
+        out = torch.full((batch, 128, 512), 123, dtype=torch.bfloat16, device="cuda")
+        large_lse = torch.full((batch, 128), float("nan"), device="cuda")
+        if page_size == 1:
+            metadata = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
+            metadata[-1] = 65
+            indices = args[3]
+        else:
+            metadata = torch.zeros(batch, dtype=torch.int32, device="cuda")
+            metadata[-1] = 65
+            indices = torch.full(
+                (batch, args[3].shape[1]), -1, dtype=torch.int32, device="cuda"
+            )
+            indices[-1:].copy_(args[3])
+        launch(q, args[1], metadata, indices, out, *args[5:], lse=large_lse)
+        torch.testing.assert_close(out[-1:], expected_out, atol=0, rtol=0)
+        torch.testing.assert_close(large_lse[-1:], expected_lse, atol=0, rtol=0)
+        for row in (0, 32768, 43691, batch - 2):
+            assert (out[row] == 0).all() and torch.isneginf(large_lse[row]).all()
+
+    @pytest.mark.parametrize("page_size", [1, 64])
+    def test_kv_beyond_4gib(self, page_size):
+        self._require_large_address_memory((1 << 32) + (1 << 20))
+        case = _make_qh128_case([65, 129], page_size=page_size)
+        args, lse, *_ = case
+        offset = (1 << 32) // (page_size * 576) + 128
+        kv = torch.empty(
+            (offset + args[1].shape[0], 1, page_size, 576),
+            dtype=args[1].dtype,
+            device="cuda",
+        )
+        # If a byte address wraps, it reads zeros instead of the selected KV.
+        kv.view(-1)[: 1 << 20].zero_()
+        kv[offset:].copy_(args[1])
+        args[1] = kv
+        args[3] = args[3] + offset
+        _QH128_ASM[page_size](*args, lse=lse)
+        _check_qh128_case(case)
+
+    def test_page_table_beyond_4gib(self):
+        self._require_large_address_memory((1 << 32) + 128)
+        case = _make_qh128_case([65, 129], page_size=64)
+        args, lse, *_ = case
+        stride = (1 << 30) + 16  # int32 elements; row 1 starts beyond 4 GiB.
+        table = torch.empty_strided(
+            args[3].shape, (stride, 1), dtype=torch.int32, device="cuda"
+        )
+        # Poison where row 1 would land if its byte offset wrapped at 32 bits.
+        table.as_strided((args[3].shape[1],), (1,), storage_offset=16).fill_(-1)
+        table.copy_(args[3])
+        args[3] = table
+        mla_decode_fwd_ps64_qh128_asm(*args, lse=lse)
+        _check_qh128_case(case)
+
     def test_ps1_empty_physical_cache_and_offset_csr(self):
         case = _make_qh128_case([0, 0], page_size=1)
         args, lse, *_ = case
