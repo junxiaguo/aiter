@@ -9,8 +9,8 @@
 #   # Sweep all supported public dispatch cases:
 #   python3 op_tests/test_mla_decode_pagesize64.py
 #
-#   # QH128 PS64 kernel with shuffled KV (one query, no KV splitting):
-#   python3 op_tests/test_mla_decode_pagesize64.py --kv-shuffled -n 128,1 --split-kv 1
+#   # QH128 automatically uses kv-shuffled PS64 (one query, no KV splitting):
+#   python3 op_tests/test_mla_decode_pagesize64.py -n 128,1
 #
 #   # GPU contract tests, including graph replay and all page tails:
 #   python3 -m pytest op_tests/test_mla_decode_pagesize64.py -q
@@ -44,8 +44,8 @@ def check_support(dtype, kv_dtype, nhead):
     return dtype == dtypes.fp8 and kv_dtype == dtypes.fp8
 
 
-# Public dispatch cases covered by this UT. The aiter MLA dispatcher maps each
-# (Gqa, qSeqLen) pair to the fixed registered gfx1250 kernel internally.
+# Dispatch cases covered by this UT. QH128 uses the dedicated kv-shuffled
+# PS64 kernel; other cases use the registered gfx1250 MLA dispatcher.
 _MI400_DISPATCH_CASES = [
     (8, 1),
     (8, 2),
@@ -422,10 +422,10 @@ def test_mla(
     dtype,
     kv_dtype,
     init,
-    kv_shuffled=False,
 ):
     page_size = 64
-    if kv_shuffled and (nhead != 128 or decode_qlen != 1 or split_kv != 1):
+    kv_shuffled = nhead == 128
+    if kv_shuffled and (decode_qlen != 1 or split_kv != 1):
         raise ValueError(
             "Shuffled PS64 kernel requires nhead=128, decode_qlen=1, split_kv=1"
         )
@@ -588,6 +588,7 @@ def test_mla(
 
     ret = {
         "gfx": get_gfx(),
+        "kv_shuffled": kv_shuffled,
         "num_kv_splits": case["num_kv_splits"],
         "init": init,
         "mi400 us": us,
@@ -705,6 +706,7 @@ def main():
         nargs="*",
         default=None,
         help="""Public MI400 dispatch case as GQA,decode_qlen.
+        QH128 always uses kv-shuffled with one KV split.
         e.g.: -n 8,3 128,1""",
     )
     parser.add_argument(
@@ -714,6 +716,7 @@ def main():
         nargs="*",
         default=None,
         help="""KV split count per batch, or auto.
+        Default: 1 for QH128; 1, 2, 3 for other head counts.
         e.g.: --split_kv 1 2 3 auto""",
     )
     parser.add_argument(
@@ -736,37 +739,45 @@ def main():
     parser.add_argument(
         "--kv-shuffled",
         action="store_true",
-        help="Use the QH128 PS64 ASM kernel with shuffled KV (one query, one KV split).",
+        help="Select QH128 cases; kv-shuffled is automatic for -n 128,1.",
     )
     args = parser.parse_args()
     if args.nhead is None:
         args.nhead = [(128, 1)] if args.kv_shuffled else _MI400_DISPATCH_CASES
-    if args.split_kv is None:
-        args.split_kv = [1] if args.kv_shuffled else [1, 2, 3]
-    if args.kv_shuffled and (
-        any(case != (128, 1) for case in args.nhead)
-        or any(splits != 1 for splits in args.split_kv)
+    if args.kv_shuffled and any(case != (128, 1) for case in args.nhead):
+        parser.error("--kv-shuffled requires -n 128,1")
+    if (
+        (128, 1) in args.nhead
+        and args.split_kv is not None
+        and any(splits != 1 for splits in args.split_kv)
     ):
-        parser.error("Shuffled PS64 requires -n 128,1 and --split-kv 1")
+        parser.error("QH128 uses kv-shuffled and requires --split-kv 1")
+    dispatch_cases = [
+        (nhead, decode_qlen, split_kv)
+        for nhead, decode_qlen in args.nhead
+        for split_kv in (
+            args.split_kv
+            if args.split_kv is not None
+            else ([1] if nhead == 128 else [1, 2, 3])
+        )
+    ]
     torch.set_default_device("cuda")
 
     rows = []
     for (
-        (nhead, decode_qlen),
+        (nhead, decode_qlen, split_kv),
         dtype,
         kv_dtype,
         batch,
         ctx_len,
-        split_kv,
         mask,
         init,
     ) in itertools.product(
-        args.nhead,
+        dispatch_cases,
         args.dtype,
         args.kv_dtype,
         args.batch,
         args.ctxLen,
-        args.split_kv,
         args.mask,
         args.init,
     ):
@@ -789,7 +800,6 @@ def main():
                 dtype,
                 kv_dtype,
                 init,
-                kv_shuffled=args.kv_shuffled,
             )
         )
 
