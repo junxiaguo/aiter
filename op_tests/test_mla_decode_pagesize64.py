@@ -422,9 +422,12 @@ def test_mla(
     dtype,
     kv_dtype,
     init,
+    kv_layout="auto",
 ):
     page_size = 64
-    kv_shuffled = nhead == 128
+    if kv_layout == "auto":
+        kv_layout = "kv_shuffled" if nhead == 128 else "token_major"
+    kv_shuffled = kv_layout == "kv_shuffled"
     if kv_shuffled and (decode_qlen != 1 or split_kv != 1):
         raise ValueError(
             "Shuffled PS64 kernel requires nhead=128, decode_qlen=1, split_kv=1"
@@ -497,44 +500,34 @@ def test_mla(
     )
 
     # Prepare the dense table and lengths outside the measured/captured launch.
+    seq_lens = page_table = None
     if kv_shuffled:
-        final_lse = torch.empty((batch, nhead), dtype=torch.float32)
         page_table = kv_indices_mi400[: batch * case["num_pages_per_batch"]].view(
             batch, case["num_pages_per_batch"]
         )
         seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32)
 
     def run_mla_decode(out_tensor):
-        if kv_shuffled:
-            mla_decode_fwd_qh128_asm(
-                q_mi400,
-                kv_buffer_mi400,
-                out_tensor,
-                seq_lens=seq_lens,
-                page_table=page_table,
-                q_scale=case["q_scale"],
-                kv_scale=case["kv_scale"],
-                softmax_scale=1.0 / (qk_head_dim**0.5),
-                lse=final_lse,
-            )
-            return out_tensor, final_lse
         return aiter.mla.mla_decode_fwd(
             q_mi400,
             kv_buffer_mi400,
             out_tensor,
-            qo_indptr,
-            case["kv_indptr"],
-            kv_indices_mi400,
-            case["kv_last_page_lens"],
+            None if kv_shuffled else qo_indptr,
+            None if kv_shuffled else case["kv_indptr"],
+            None if kv_shuffled else kv_indices_mi400,
+            None if kv_shuffled else case["kv_last_page_lens"],
             decode_qlen,
             case["page_size"],
             nhead_kv,
             1.0 / (qk_head_dim**0.5),
             num_kv_splits=case["num_kv_splits"],
-            num_kv_splits_indptr=case["num_kv_splits_indptr"],
+            num_kv_splits_indptr=None if kv_shuffled else case["num_kv_splits_indptr"],
             q_scale=case["q_scale"],
             kv_scale=case["kv_scale"],
             return_lse=True,
+            kv_layout=kv_layout,
+            seq_lens=seq_lens,
+            page_table=page_table,
         )
 
     out = torch.zeros((batch * decode_qlen, nhead, v_head_dim), dtype=torch.bfloat16)
@@ -588,6 +581,7 @@ def test_mla(
 
     ret = {
         "gfx": get_gfx(),
+        "kv_layout": kv_layout,
         "kv_shuffled": kv_shuffled,
         "num_kv_splits": case["num_kv_splits"],
         "init": init,
@@ -638,6 +632,7 @@ def _format_summary(rows):
         "dtype",
         "kv_dtype",
         "gfx",
+        "kv_layout",
         "kv_shuffled",
         "init",
         "mi400 us",
@@ -706,7 +701,7 @@ def main():
         nargs="*",
         default=None,
         help="""Public MI400 dispatch case as GQA,decode_qlen.
-        QH128 always uses kv-shuffled with one KV split.
+        QH128 defaults to kv-shuffled with one KV split.
         e.g.: -n 8,3 128,1""",
     )
     parser.add_argument(
@@ -737,28 +732,43 @@ def main():
         e.g.: --init randn const0.25""",
     )
     parser.add_argument(
+        "--kv-layout",
+        choices=["auto", "token_major", "kv_shuffled"],
+        default="auto",
+        help="auto selects shuffled for QH128; token_major uses legacy segmented PS64",
+    )
+    parser.add_argument(
         "--kv-shuffled",
         action="store_true",
         help="Select QH128 cases; kv-shuffled is automatic for -n 128,1.",
     )
     args = parser.parse_args()
+    if args.kv_shuffled:
+        if args.kv_layout == "token_major":
+            parser.error("--kv-shuffled conflicts with --kv-layout token_major")
+        args.kv_layout = "kv_shuffled"
     if args.nhead is None:
-        args.nhead = [(128, 1)] if args.kv_shuffled else _MI400_DISPATCH_CASES
-    if args.kv_shuffled and any(case != (128, 1) for case in args.nhead):
-        parser.error("--kv-shuffled requires -n 128,1")
+        args.nhead = (
+            [(128, 1)] if args.kv_layout == "kv_shuffled" else _MI400_DISPATCH_CASES
+        )
+    if args.kv_layout == "kv_shuffled" and any(case != (128, 1) for case in args.nhead):
+        parser.error("kv_shuffled requires -n 128,1")
     if (
         (128, 1) in args.nhead
+        and args.kv_layout != "token_major"
         and args.split_kv is not None
         and any(splits != 1 for splits in args.split_kv)
     ):
-        parser.error("QH128 uses kv-shuffled and requires --split-kv 1")
+        parser.error("kv_shuffled requires --split-kv 1")
     dispatch_cases = [
         (nhead, decode_qlen, split_kv)
         for nhead, decode_qlen in args.nhead
         for split_kv in (
             args.split_kv
             if args.split_kv is not None
-            else ([1] if nhead == 128 else [1, 2, 3])
+            else (
+                [1] if nhead == 128 and args.kv_layout != "token_major" else [1, 2, 3]
+            )
         )
     ]
     torch.set_default_device("cuda")
@@ -800,6 +810,7 @@ def main():
                 dtype,
                 kv_dtype,
                 init,
+                args.kv_layout,
             )
         )
 
@@ -1077,6 +1088,231 @@ class TestMlaQh128:
         args["page_table"] = table
         mla_decode_fwd_qh128_asm(**args, lse=lse)
         _check_qh128_case(case)
+
+
+def _run_atom_shuffled(args, **overrides):
+    kwargs = {
+        "q": args["q"],
+        "kv_buffer": args["kv"],
+        "o": args["out"],
+        "qo_indptr": None,
+        "kv_indptr": None,
+        "kv_indices": None,
+        "kv_last_page_lens": None,
+        "max_seqlen_q": 1,
+        "page_size": 64,
+        "sm_scale": args["softmax_scale"],
+        "q_scale": args["q_scale"],
+        "kv_scale": args["kv_scale"],
+        "kv_layout": "kv_shuffled",
+        "seq_lens": args["seq_lens"],
+        "page_table": args["page_table"],
+    }
+    kwargs.update(overrides)
+    return aiter.mla.mla_decode_fwd(**kwargs)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250",
+    reason="requires gfx1250",
+)
+class TestMlaV3Unified:
+    @pytest.mark.parametrize("return_lse", [False, True])
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_atom_cpu_scales_and_return_contract(self, return_lse, causal):
+        case = _make_qh128_case([0, 65, 129])
+        args, *_ = case
+        expected, expected_lse = _ref_qh128_case(case)
+        out, lse = _run_atom_shuffled(
+            args,
+            q_scale=torch.tensor(0.75, dtype=torch.float32, device="cpu"),
+            kv_scale=torch.tensor(1.25, dtype=torch.float32, device="cpu"),
+            return_lse=return_lse,
+            causal=causal,
+        )
+        assert out is args["out"]
+        torch.testing.assert_close(out.float().cpu(), expected, atol=0.06, rtol=0.06)
+        if return_lse:
+            assert lse.shape == (3, 128) and lse.dtype == torch.float32
+            torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.02, rtol=0.002)
+        else:
+            assert lse is None
+
+    def test_scale_cache_reuses_values_and_observes_cpu_updates(self):
+        case = _make_qh128_case([65], scale_values=(0.875, 1.125))
+        args, *_ = case
+        cpu_q = torch.tensor(0.875, dtype=torch.float32, device="cpu")
+        cpu_kv = torch.tensor(1.125, dtype=torch.float32, device="cpu")
+        scale = aiter.mla._mla_scale_on_device(cpu_q, args["q"], "q_scale")
+        out, _ = _run_atom_shuffled(args, q_scale=cpu_q, kv_scale=cpu_kv)
+        before = aiter.mla._mla_cpu_scale_on_device.cache_info()
+        _run_atom_shuffled(args, q_scale=cpu_q.clone(), kv_scale=cpu_kv.clone())
+        after = aiter.mla._mla_cpu_scale_on_device.cache_info()
+        assert after.misses == before.misses and after.hits >= before.hits + 2
+        assert aiter.mla._mla_scale_on_device(cpu_q, args["q"], "q_scale") is scale
+        torch.testing.assert_close(
+            out.float().cpu(), _ref_qh128_case(case)[0], atol=0.06, rtol=0.06
+        )
+        cpu_q.fill_(0.5)
+        args["q_scale"].fill_(0.5)
+        assert aiter.mla._mla_scale_on_device(cpu_q, args["q"], "q_scale") is not scale
+        _run_atom_shuffled(args, q_scale=cpu_q, kv_scale=cpu_kv)
+        torch.testing.assert_close(
+            out.float().cpu(), _ref_qh128_case(case)[0], atol=0.06, rtol=0.06
+        )
+
+    @pytest.mark.parametrize("unit_scales", [False, True])
+    def test_atom_graph_replay_with_cpu_scales(self, unit_scales):
+        values = (1.0, 1.0) if unit_scales else (0.75, 1.25)
+        args, *_ = _make_qh128_case([65, 129], scale_values=values)
+        scales = {
+            "q_scale": None if unit_scales else torch.tensor(values[0], device="cpu"),
+            "kv_scale": None if unit_scales else torch.tensor(values[1], device="cpu"),
+        }
+        expected, expected_lse = _run_atom_shuffled(args, return_lse=True, **scales)
+        expected = expected.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                out, lse = _run_atom_shuffled(args, return_lse=True, **scales)
+            graph.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+        args["seq_lens"].zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert (out == 0).all() and torch.isneginf(lse).all()
+
+    def test_uncached_cpu_scale_rejected_during_capture(self, monkeypatch):
+        args, *_ = _make_qh128_case([65])
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="Warm up"):
+            aiter.mla._mla_scale_on_device(
+                torch.tensor(123.125, device="cpu"), args["q"], "q_scale"
+            )
+
+    @pytest.mark.parametrize(
+        "overrides,message",
+        [
+            ({"max_seqlen_q": 2}, "max_seqlen_q=1"),
+            ({"page_size": 1}, "page_size=64"),
+            ({"nhead_kv": 2}, "nhead_kv=1"),
+            ({"num_kv_splits": 2}, "KV splitting"),
+            ({"return_logits": True}, "partial logits"),
+            ({"cp_world_size": 2}, "context parallelism"),
+            ({"logit_cap": 1.0}, "logit_cap"),
+            ({"intra_batch_mode": True}, "split/persistent metadata"),
+            ({"kv_layout": "typo"}, "unknown MLA kv_layout"),
+            ({"seq_lens": None}, "seq_lens and page_table"),
+        ],
+    )
+    def test_unsupported_options_fail_before_launch(
+        self, overrides, message, monkeypatch
+    ):
+        args, *_ = _make_qh128_case([65])
+
+        def unexpected_launch(*args, **kwargs):
+            pytest.fail("unsupported inputs reached the native launcher")
+
+        monkeypatch.setattr(aiter.mla, "mla_decode_v3_asm_fwd", unexpected_launch)
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            _run_atom_shuffled(args, **overrides)
+
+    @pytest.mark.parametrize(
+        "field,message",
+        [
+            ("q", "Q must be"),
+            ("kv_buffer", "dtype"),
+            ("o", "dtype"),
+            ("seq_lens", "seq_lens"),
+            ("page_table", "page_table"),
+            ("q_scale", "FP32"),
+        ],
+    )
+    def test_atom_tensor_contract_checked_in_python(self, field, message, monkeypatch):
+        args, *_ = _make_qh128_case([65])
+        invalid = {
+            "q": args["q"][:, :64],
+            "kv_buffer": args["kv"].to(torch.bfloat16),
+            "o": args["out"].float(),
+            "seq_lens": torch.zeros(2, dtype=torch.int32, device="cuda"),
+            "page_table": torch.zeros((2, 4), dtype=torch.int32, device="cuda"),
+            "q_scale": torch.tensor(1.0, dtype=torch.float64, device="cpu"),
+        }
+
+        def unexpected_launch(*args, **kwargs):
+            pytest.fail("invalid tensors reached the native launcher")
+
+        monkeypatch.setattr(aiter.mla, "mla_decode_v3_asm_fwd", unexpected_launch)
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            _run_atom_shuffled(args, **{field: invalid[field]})
+
+    def test_wrong_arch_has_no_fallback(self, monkeypatch):
+        args, *_ = _make_qh128_case([65])
+        monkeypatch.setattr(aiter.mla, "get_gfx", lambda: "gfx950")
+        with pytest.raises(RuntimeError, match="requires gfx1250"):
+            _run_atom_shuffled(args)
+
+    @pytest.mark.parametrize("nhead,decode_qlen", _MI400_DISPATCH_CASES)
+    @pytest.mark.parametrize("splits", [1, 3])
+    def test_segmented_variants_keep_reference_output(self, nhead, decode_qlen, splits):
+        batch, ctx_len = 2, 321
+        case = _make_mla_mi400_case(
+            batch=batch,
+            ctx_lens=ctx_len,
+            nhead=nhead,
+            decode_qlen=decode_qlen,
+            num_kv_splits=splits,
+        )
+        q_ref = (torch.randn(batch * decode_qlen, nhead, 576, device="cuda") * 0.25).to(
+            dtypes.fp8
+        )
+        q = _make_mla_mi400_q_case(
+            q_fp8=q_ref,
+            batch=batch,
+            decode_qlen=decode_qlen,
+            nhead=nhead,
+            qk_head_dim=576,
+            v_head_dim=512,
+        )
+        kv, kv_ref, indices = _make_mla_mi400_kv_case(
+            kv_buffer_bf16=torch.randn(
+                batch * 6 * 64, 1, 576, dtype=torch.bfloat16, device="cuda"
+            )
+            * 0.25,
+            batch=batch,
+            ctx_lens=ctx_len,
+            qk_head_dim=576,
+            v_head_dim=512,
+            page_indices_oob=4,
+        )
+        out = torch.empty(
+            (batch * decode_qlen, nhead, 512), dtype=torch.bfloat16, device="cuda"
+        )
+        aiter.mla.mla_decode_fwd(
+            q,
+            kv,
+            out,
+            torch.arange(batch + 1, dtype=torch.int32, device="cuda") * decode_qlen,
+            case["kv_indptr"],
+            indices,
+            case["kv_last_page_lens"],
+            decode_qlen,
+            page_size=64,
+            num_kv_splits=splits,
+            num_kv_splits_indptr=case["num_kv_splits_indptr"],
+            q_scale=case["q_scale"],
+            kv_scale=case["kv_scale"],
+        )
+        ref = _ref_mla_mi400(
+            case, q_ref, kv_ref, indices, batch, ctx_len, decode_qlen, 1, 576, 512, 1
+        )
+        assert torch.isfinite(out).all()
+        torch.testing.assert_close(out, ref, atol=0.06, rtol=0.06)
 
 
 if __name__ == "__main__":

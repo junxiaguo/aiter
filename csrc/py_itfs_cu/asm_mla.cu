@@ -1651,3 +1651,62 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                          static_cast<uint32_t>(page_table->size(1)), 0};
     launch_mla_qh128(args, q->device_id, static_cast<int>(batch), stream);
 }
+
+// Unified MLA v3 launcher. Layout selects the ABI; the existing manifest
+// dispatch selects the QH/query-length variant within that ABI. Keep the
+// older entry points available for callers using their original signatures.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
+    mla_decode_v3_asm_fwd,
+    (aiter_tensor_t* q,
+     aiter_tensor_t* kv,
+     aiter_tensor_t* out,
+     aiter_tensor_t* q_scale,
+     aiter_tensor_t* kv_scale,
+     float softmax_scale,
+     int kv_layout,
+     int page_size,
+     int max_seqlen_q,
+     int nhead_kv,
+     aiter_tensor_t* seq_lens,
+     aiter_tensor_t* page_table,
+     aiter_tensor_t* qo_indptr,
+     aiter_tensor_t* kv_indptr,
+     aiter_tensor_t* kv_page_indices,
+     aiter_tensor_t* kv_last_page_lens,
+     aiter_tensor_t* num_kv_splits_indptr,
+     aiter_tensor_t* split_data,
+     aiter_tensor_t* split_lse,
+     aiter_tensor_t* valid_split_count,
+     aiter_tensor_t* lse,
+     hipStream_t stream),
+    (q, kv, out, q_scale, kv_scale, softmax_scale, kv_layout, page_size,
+     max_seqlen_q, nhead_kv, seq_lens, page_table, qo_indptr, kv_indptr,
+     kv_page_indices, kv_last_page_lens, num_kv_splits_indptr, split_data,
+     split_lse, valid_split_count, lse, stream))
+{
+    AITER_CHECK(q != nullptr && q->is_gpu(), "Q must be a GPU tensor");
+    const HipDeviceGuard guard(q->device_id);
+    AITER_CHECK(page_size == 64 && nhead_kv == 1,
+                "MLA v3 ASM requires page_size=64 and nhead_kv=1");
+    if(kv_layout == 1)
+    {
+        AITER_CHECK(max_seqlen_q == 1, "kv_shuffled MLA requires max_seqlen_q=1");
+        AITER_CHECK(qo_indptr == nullptr && kv_indptr == nullptr &&
+                        kv_page_indices == nullptr && kv_last_page_lens == nullptr &&
+                        num_kv_splits_indptr == nullptr && split_data == nullptr &&
+                        split_lse == nullptr && valid_split_count == nullptr,
+                    "kv_shuffled MLA uses dense metadata without split workspaces");
+        return mla_ps64_qh128_fp8_asm_fwd_impl(
+            q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, softmax_scale, stream);
+    }
+    AITER_CHECK(kv_layout == 0, "unknown MLA v3 ASM kv_layout: ", kv_layout);
+    AITER_CHECK(seq_lens == nullptr && page_table == nullptr,
+                "segmented MLA uses CSR metadata, not seq_lens/page_table");
+    AITER_CHECK(split_data != nullptr && split_data->dim() == 4 && split_data->size(1) > 0,
+                "segmented MLA requires split_data[total_q,splits,heads,512]");
+    mla_decode_gfx1250_dispatch(
+        q, kv, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens,
+        num_kv_splits_indptr, nullptr, nullptr, nullptr, max_seqlen_q,
+        page_size, nhead_kv, softmax_scale, split_data, split_lse, out, lse,
+        q_scale, kv_scale, valid_split_count, split_data->size(1) > 1, stream);
+}
