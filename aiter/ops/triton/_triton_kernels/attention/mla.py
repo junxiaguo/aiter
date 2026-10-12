@@ -707,10 +707,15 @@ def _mla_decode_fwd_reduce_kernel(
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    tiles_per_segment = tl.maximum(cdiv_fn(seq_len, num_segments * TILE_SIZE), 1)
 
-    # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+    # MTP queries have different causal prefixes. Later segments may be
+    # unwritten for an earlier query even though they are active for the sequence.
+    prefix_len = seq_len
+    if not ALL_DECODE:
+        query_pos = query_token_idx - tl.load(query_start_len_ptr + seq_idx)
+        prefix_len = tl.maximum(seq_len - num_tokens_per_seq + query_pos + 1, 0)
+    act_num_segments = cdiv_fn(prefix_len, tiles_per_segment * TILE_SIZE)
     segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
     )
@@ -723,6 +728,7 @@ def _mla_decode_fwd_reduce_kernel(
     )
     segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
     overall_max = tl.max(segm_max)
+    overall_max = tl.where(overall_max == float("-inf"), 0.0, overall_max)
 
     # load and rescale segment exp sums
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)

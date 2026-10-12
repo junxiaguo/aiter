@@ -32,7 +32,7 @@ import aiter
 import aiter.mla
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.mla import mla_decode_fwd_qh128_asm
+from aiter.mla import mla_decode_fwd
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_printoptions(sci_mode=False)
@@ -108,12 +108,13 @@ def _pack_rope_split2_kv_pages(tensor, nope_dim, rope_dim):
 
 
 def _pack_kv_shuffled_pages(tensor, nope_dim=512, rope_dim=64):
-    """Pack FP8 page64 KV into the kv-shuffled layout consumed by the QH128 CO."""
+    """Pack page64 KV into the kv-shuffled layout (16-wide FP8, 8-wide BF16)."""
     pages = tensor.shape[0]
+    width = 16 if tensor.dtype == torch.float8_e4m3fn else 8
     kv = tensor.reshape(pages, 64, nope_dim + rope_dim)
     return torch.cat(
         [
-            part.reshape(pages, 4, 16, dim // 16, 16)
+            part.reshape(pages, 4, 16, dim // width, width)
             .permute(0, 1, 3, 2, 4)
             .contiguous()
             .reshape(pages, -1)
@@ -498,26 +499,12 @@ def test_mla(
 
     # Prepare the dense table and lengths outside the measured/captured launch.
     if kv_shuffled:
-        final_lse = torch.empty((batch, nhead), dtype=torch.float32)
         page_table = kv_indices_mi400[: batch * case["num_pages_per_batch"]].view(
             batch, case["num_pages_per_batch"]
         )
         seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32)
 
     def run_mla_decode(out_tensor):
-        if kv_shuffled:
-            mla_decode_fwd_qh128_asm(
-                q_mi400,
-                kv_buffer_mi400,
-                out_tensor,
-                seq_lens=seq_lens,
-                page_table=page_table,
-                q_scale=case["q_scale"],
-                kv_scale=case["kv_scale"],
-                softmax_scale=1.0 / (qk_head_dim**0.5),
-                lse=final_lse,
-            )
-            return out_tensor, final_lse
         return aiter.mla.mla_decode_fwd(
             q_mi400,
             kv_buffer_mi400,
@@ -531,10 +518,13 @@ def test_mla(
             nhead_kv,
             1.0 / (qk_head_dim**0.5),
             num_kv_splits=case["num_kv_splits"],
-            num_kv_splits_indptr=case["num_kv_splits_indptr"],
+            num_kv_splits_indptr=None if kv_shuffled else case["num_kv_splits_indptr"],
             q_scale=case["q_scale"],
             kv_scale=case["kv_scale"],
-            return_lse=True,
+            return_lse=not kv_shuffled,
+            kv_layout="kv_shuffled" if kv_shuffled else "token_major",
+            seq_lens=seq_lens if kv_shuffled else None,
+            page_table=page_table if kv_shuffled else None,
         )
 
     out = torch.zeros((batch * decode_qlen, nhead, v_head_dim), dtype=torch.bfloat16)
@@ -556,7 +546,10 @@ def test_mla(
         logits_shape = (batch * decode_qlen, nhead, v_head_dim)
     assert out_check.shape == (batch * decode_qlen, nhead, v_head_dim)
     assert attn_logits.shape == logits_shape
-    assert attn_lse.shape == (batch * decode_qlen, nhead)
+    if kv_shuffled:
+        assert attn_lse is None
+    else:
+        assert attn_lse.shape == (batch * decode_qlen, nhead)
 
     final_out_finite = torch.isfinite(out_check.detach().float().cpu()).all().item()
     if final_out_finite:
@@ -814,7 +807,18 @@ def main():
     )
 
 
-def _make_qh128_case(lengths, stride=576, scale_values=(0.75, 1.25)):
+def _make_qh128_case(
+    lengths,
+    stride=576,
+    scale_values=(0.75, 1.25),
+    *,
+    nhead=128,
+    decode_qlen=1,
+    q_dtype=torch.float8_e4m3fn,
+    kv_dtype=torch.float8_e4m3fn,
+    out_dtype=torch.bfloat16,
+    poison=True,
+):
     page_size = 64
     generator = torch.Generator().manual_seed(19)
     batch = len(lengths)
@@ -823,71 +827,77 @@ def _make_qh128_case(lengths, stride=576, scale_values=(0.75, 1.25)):
     width = max(1, max(counts, default=0))
     ids = torch.randperm(pages, generator=generator)
     table = torch.full((batch, width + 3), -1, dtype=torch.int32)
-    q = torch.randn(batch, 128, stride, generator=generator).to(torch.float8_e4m3fn)
-    # Poison Q padding: the kernel may not read beyond the 576 logical values.
+    q = torch.randn(batch * decode_qlen, nhead, stride, generator=generator).to(q_dtype)
     q[..., 576:] = float("nan")
-    kv = torch.randn(pages, page_size, 576, generator=generator).to(torch.float8_e4m3fn)
+    kv = torch.randn(pages, page_size, 576, generator=generator).to(kv_dtype)
     offset = 0
     for row, (length, count) in enumerate(zip(lengths, counts)):
         table[row, :count] = ids[offset : offset + count]
         offset += count
-        if length % page_size:
+        if poison and length % page_size:
             kv[table[row, count - 1], length % page_size :] = float("nan")
     raw = torch.full(
-        (batch * 128 * 512 + 32,), 123, dtype=torch.bfloat16, device="cuda"
+        (batch * decode_qlen * nhead * 512 + 32,), 123, dtype=out_dtype, device="cuda"
     )
-    out = raw[16:-16].view(batch, 128, 512)
-    raw_lse = torch.full(
-        (batch * 128 + 32,), float("nan"), dtype=torch.float32, device="cuda"
-    )
-    lse = raw_lse[16:-16].view(batch, 128)
-    # Allocate scales once during setup; every eager/graph launch reuses them.
+    out = raw[16:-16].view(batch * decode_qlen, nhead, 512)
     scales = [
-        torch.tensor([v], dtype=torch.float32, device="cuda") for v in scale_values
+        None if v is None else torch.tensor([v], dtype=torch.float32, device="cuda")
+        for v in scale_values
     ]
     kwargs = {
         "q": q.to("cuda")[..., :576],
-        "kv": _pack_kv_shuffled_pages(kv).to("cuda"),
-        "out": out,
+        "kv_buffer": _pack_kv_shuffled_pages(kv).to("cuda"),
+        "o": out,
         "seq_lens": torch.tensor(lengths, dtype=torch.int32, device="cuda"),
         "page_table": table.to("cuda")[:, :width],
         "q_scale": scales[0],
         "kv_scale": scales[1],
-        "softmax_scale": 1 / 24,
+        "sm_scale": 1 / 24,
+        "page_size": 64,
+        "kv_layout": "kv_shuffled",
+        "max_seqlen_q": decode_qlen,
     }
-    return kwargs, lse, raw, q[..., :576].float(), kv.float(), table, lengths
+    return kwargs, raw, q[..., :576].float(), kv.float(), table, lengths
 
 
 def _ref_qh128_case(case):
-    args, _, _, q, kv, table, lengths = case
-    page_size = kv.shape[1]
-    q_scale = args["q_scale"].cpu().item()
-    kv_scale = args["kv_scale"].cpu().item()
-    outputs = torch.zeros(len(lengths), 128, 512)
-    lse = torch.full((len(lengths), 128), -float("inf"))
+    args, _, q, kv, table, lengths = case
+    q_scale = 1.0 if args["q_scale"] is None else args["q_scale"].cpu().item()
+    kv_scale = 1.0 if args["kv_scale"] is None else args["kv_scale"].cpu().item()
+    qlen = args["max_seqlen_q"]
+    outputs = torch.zeros(*q.shape[:2], 512)
     for row, length in enumerate(lengths):
         if not length:
             continue
-        count = (length + page_size - 1) // page_size
+        count = (length + 63) // 64
         keys = kv[table[row, :count].long()].reshape(-1, 576)[:length]
-        scores = (q[row] @ keys.T) * (q_scale * kv_scale * args["softmax_scale"])
-        outputs[row] = torch.softmax(scores, -1) @ (keys[:, :512] * kv_scale)
-        lse[row] = torch.logsumexp(scores, -1)
-    return outputs, lse
+        for i in range(qlen):
+            end = length - qlen + i + 1
+            if end <= 0:
+                continue
+            query = row * qlen + i
+            scores = (q[query] @ keys[:end].T) * (q_scale * kv_scale * args["sm_scale"])
+            outputs[query] = torch.softmax(scores, -1) @ (keys[:end, :512] * kv_scale)
+    return outputs
 
 
 def _check_qh128_case(case):
-    args, lse, raw, *_, lengths = case
-    expected, expected_lse = _ref_qh128_case(case)
-    got = args["out"].float().cpu()
+    args, raw, *_, lengths = case
+    expected = _ref_qh128_case(case)
+    got = args["o"].float().cpu()
     assert torch.isfinite(got).all()
     assert (raw[:16] == 123).all() and (raw[-16:] == 123).all()
-    assert torch.isnan(lse._base[:16]).all() and torch.isnan(lse._base[-16:]).all()
     denom = expected.square().mean().sqrt().clamp_min(1e-8)
     assert (got - expected).square().mean().sqrt() / denom < 0.06
-    torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.02, rtol=0.002)
-    empty = torch.tensor(lengths) == 0
-    assert (got[empty] == 0).all() and torch.isneginf(lse.cpu()[empty]).all()
+    empty = (torch.tensor(lengths) == 0).repeat_interleave(args["max_seqlen_q"])
+    assert (got[empty] == 0).all()
+
+
+def _run_qh128_case(case):
+    args = case[0]
+    out, lse = mla_decode_fwd(**args)
+    assert out is args["o"] and lse is None
+    _check_qh128_case(case)
 
 
 @pytest.mark.skipif(
@@ -905,36 +915,42 @@ class TestMlaQh128:
             ([1024, 4096, 4097, 5120], 576),
         ],
     )
-    def test_reference_and_lse(self, lengths, stride):
-        case = _make_qh128_case(lengths, stride)
-        args, lse, *_ = case
-        assert mla_decode_fwd_qh128_asm(**args, lse=lse) is args["out"]
-        _check_qh128_case(case)
-        previous = args["out"].clone()
-        args["out"].zero_()
-        assert mla_decode_fwd_qh128_asm(**args) is args["out"]
-        torch.testing.assert_close(args["out"], previous, atol=0, rtol=0)
+    def test_reference(self, lengths, stride, monkeypatch):
+        native = aiter.mla.mla_ps64_qh128_fp8_asm_fwd
+        calls = []
+
+        def launch(*args):
+            calls.append(args)
+            return native(*args)
+
+        monkeypatch.setattr(aiter.mla, "mla_ps64_qh128_fp8_asm_fwd", launch)
+        _run_qh128_case(_make_qh128_case(lengths, stride))
+        assert len(calls) == 1 and calls[0][5] is None
 
     @pytest.mark.parametrize("scale_values", [(1.0, 1.0), (0.75, 1.25)])
     def test_stream_graph_and_dynamic_metadata(self, scale_values):
         case = _make_qh128_case([65, 321], scale_values=scale_values)
-        args, lse, *_ = case
-        mla_decode_fwd_qh128_asm(**args, lse=lse)
-        reference_output = args["out"].clone()
+        self._check_graph(case)
+
+    @staticmethod
+    def _check_graph(case):
+        args = case[0]
+        _run_qh128_case(case)
+        reference_output = args["o"].clone()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            mla_decode_fwd_qh128_asm(**args, lse=lse)
+            mla_decode_fwd(**args)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                mla_decode_fwd_qh128_asm(**args, lse=lse)
+                mla_decode_fwd(**args)
             graph.replay()
         torch.cuda.current_stream().wait_stream(stream)
-        torch.testing.assert_close(args["out"], reference_output, atol=0, rtol=0)
+        torch.testing.assert_close(args["o"], reference_output, atol=0, rtol=0)
         args["seq_lens"].zero_()
         graph.replay()
         torch.cuda.synchronize()
-        assert (args["out"] == 0).all() and torch.isneginf(lse).all()
+        assert (args["o"] == 0).all()
 
     def test_ps64_invalid_metadata_is_not_addressed(self):
         for bad_length, bad_page in [
@@ -943,68 +959,141 @@ class TestMlaQh128:
             (-1, None),
             (1000000, None),
         ]:
-            args, lse, *_ = _make_qh128_case([129])
+            args = _make_qh128_case([129])[0]
             if bad_length is not None:
                 args["seq_lens"].fill_(bad_length)
             if bad_page is not None:
                 args["page_table"][0, 1] = bad_page
-            mla_decode_fwd_qh128_asm(**args, lse=lse)
-            assert (args["out"] == 0).all() and torch.isneginf(lse).all()
+            mla_decode_fwd(**args)
+            assert (args["o"] == 0).all()
 
     def test_host_contract_rejection_and_empty_batch(self):
-        args, lse, *_ = _make_qh128_case([64])
-        broken = dict(args)
-        broken["q"] = args["q"][:, :64]
-        with pytest.raises(RuntimeError, match="Q must be"):
-            mla_decode_fwd_qh128_asm(**broken, lse=lse)
-        broken = dict(args)
-        broken["seq_lens"] = args["seq_lens"].to(torch.int64)
-        with pytest.raises(RuntimeError, match="dtype"):
-            mla_decode_fwd_qh128_asm(**broken, lse=lse)
-        broken = dict(args)
-        broken["page_table"] = torch.zeros((1, 4), dtype=torch.int32, device="cuda")[
-            :, ::2
-        ]
-        with pytest.raises(RuntimeError, match="page_table"):
-            mla_decode_fwd_qh128_asm(**broken, lse=lse)
-        broken = dict(args)
-        broken["kv"] = torch.empty(
-            (1, 1, 1, 576),
-            dtype=torch.float8_e4m3fn,
-            device="cuda",
+        args = _make_qh128_case([64])[0]
+        broken = dict(args, q=args["q"][:, :64])
+        with pytest.raises(ValueError, match="out must be"):
+            mla_decode_fwd(**broken)
+        broken = dict(args, seq_lens=args["seq_lens"].to(torch.int64))
+        with pytest.raises(ValueError, match="int32"):
+            mla_decode_fwd(**broken)
+        broken = dict(
+            args,
+            page_table=torch.zeros((1, 4), dtype=torch.int32, device="cuda")[:, ::2],
         )
-        with pytest.raises(RuntimeError, match="KV must be"):
-            mla_decode_fwd_qh128_asm(**broken, lse=lse)
-        args, lse, *_ = _make_qh128_case([])
-        assert mla_decode_fwd_qh128_asm(**args, lse=lse).numel() == 0
+        with pytest.raises(ValueError, match="page_table"):
+            mla_decode_fwd(**broken)
+        broken = dict(
+            args,
+            kv_buffer=torch.empty(
+                (1, 1, 1, 576), dtype=torch.float8_e4m3fn, device="cuda"
+            ),
+        )
+        with pytest.raises(ValueError, match="requires KV"):
+            mla_decode_fwd(**broken)
+        args = _make_qh128_case([])[0]
+        out, lse = mla_decode_fwd(**args)
+        assert out.numel() == 0 and lse is None
 
     def test_rejects_missing_metadata(self):
-        args, lse, *_ = _make_qh128_case([65])
+        args = _make_qh128_case([65])[0]
         for name in ("seq_lens", "page_table"):
-            broken = dict(args)
-            broken[name] = None
-            with pytest.raises(
-                ValueError, match="seq_lens and page_table are required"
-            ):
-                mla_decode_fwd_qh128_asm(**broken, lse=lse)
+            with pytest.raises(ValueError, match="requires seq_lens and page_table"):
+                mla_decode_fwd(**dict(args, **{name: None}))
+
+    @pytest.mark.parametrize("layout", ["unknown", "token_major"])
+    def test_rejects_layout_metadata_mismatch(self, layout):
+        args = _make_qh128_case([65])[0]
+        with pytest.raises(ValueError, match="kv_layout"):
+            mla_decode_fwd(**dict(args, kv_layout=layout))
+
+    @pytest.mark.parametrize(
+        "options,error",
+        [
+            ({"return_lse": True}, "return_lse"),
+            ({"return_logits": True}, "partial logits"),
+            ({"cp_world_size": 2}, "CP/DCP"),
+            ({"cp_rank": 1}, "CP/DCP"),
+            ({"intra_batch_mode": True}, "work metadata"),
+        ],
+    )
+    def test_rejects_unsupported_semantics(self, options, error):
+        args = _make_qh128_case([65])[0]
+        with pytest.raises(ValueError, match=error):
+            mla_decode_fwd(**dict(args, **options))
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "num_kv_splits_indptr",
+            "work_meta_data",
+            "work_indptr",
+            "work_info_set",
+            "reduce_indptr",
+            "reduce_final_map",
+            "reduce_partial_map",
+        ],
+    )
+    def test_rejects_work_metadata(self, name):
+        args = _make_qh128_case([65])[0]
+        args[name] = torch.zeros(1, dtype=torch.int32, device="cuda")
+        with pytest.raises(ValueError, match="work metadata"):
+            mla_decode_fwd(**args)
 
     def test_shared_pages_and_unit_scales(self):
         case = _make_qh128_case([65, 65], scale_values=(1.0, 1.0))
-        args, lse, _, _, _, table, _ = case
+        args, _, _, _, table, _ = case
         table[1].copy_(table[0])
         args["page_table"][1].copy_(args["page_table"][0])
-        mla_decode_fwd_qh128_asm(**args, lse=lse)
-        _check_qh128_case(case)
+        _run_qh128_case(case)
+
+    @pytest.mark.parametrize("scale_values", [(None, 1.25), (0.75, None), (None, None)])
+    def test_missing_scales_use_fallback(self, scale_values, monkeypatch):
+        self._forbid_asm(monkeypatch)
+        _run_qh128_case(
+            _make_qh128_case([65, 129], scale_values=scale_values, poison=False)
+        )
+
+    @staticmethod
+    def _forbid_asm(monkeypatch):
+        def unexpected(*args, **kwargs):
+            pytest.fail("ineligible input reached QH128 ASM")
+
+        monkeypatch.setattr(aiter.mla, "mla_ps64_qh128_fp8_asm_fwd", unexpected)
 
     @pytest.mark.parametrize(
-        "missing_scales", [("q_scale",), ("kv_scale",), ("q_scale", "kv_scale")]
+        "options",
+        [
+            {"nhead": 64},
+            {"q_dtype": torch.bfloat16},
+            {"q_dtype": torch.bfloat16, "kv_dtype": torch.bfloat16},
+            {"decode_qlen": 2},
+            {"decode_qlen": 2, "q_dtype": torch.bfloat16},
+            {"decode_qlen": 4},
+            {"decode_qlen": 4, "nhead": 8},
+            {"stride": 640},
+            {"out_dtype": torch.float32},
+        ],
     )
-    def test_requires_explicit_scales(self, missing_scales):
-        args, lse, *_ = _make_qh128_case([65])
-        for name in missing_scales:
-            args[name] = None
-        with pytest.raises(ValueError, match="q_scale and kv_scale are required"):
-            mla_decode_fwd_qh128_asm(**args, lse=lse)
+    def test_fallback_reference(self, options, monkeypatch):
+        self._forbid_asm(monkeypatch)
+        _run_qh128_case(_make_qh128_case([65, 129], poison=False, **options))
+
+    @pytest.mark.parametrize("reason", ["architecture", "stepping", "split"])
+    def test_fallback_dispatch_guards(self, reason, monkeypatch):
+        self._forbid_asm(monkeypatch)
+        case = _make_qh128_case([65, 129], poison=False)
+        if reason == "architecture":
+            monkeypatch.setattr(aiter.mla, "get_gfx", lambda: "gfx950")
+        elif reason == "stepping":
+            monkeypatch.setattr(aiter.mla, "is_gfx1250_asm_supported", lambda: False)
+        else:
+            case[0]["num_kv_splits"] = 2
+        _run_qh128_case(case)
+
+    def test_fallback_graph(self):
+        case = _make_qh128_case(
+            [65, 129], nhead=64, q_dtype=torch.bfloat16, poison=False
+        )
+        self._check_graph(case)
 
     @staticmethod
     def _require_large_address_memory(nbytes):
@@ -1013,70 +1102,58 @@ class TestMlaQh128:
             pytest.skip("insufficient free memory for a >4 GiB address regression")
 
     def test_q_and_out_beyond_4gib(self):
-        # Q's padded stride crosses 4 GiB at B=43691; O crosses it at B=32768.
         batch = 48000
-        self._require_large_address_memory(batch * 128 * (768 + 512 * 2 + 4))
-        case = _make_qh128_case([65], stride=768)
-        args, lse, *_ = case
-        mla_decode_fwd_qh128_asm(**args, lse=lse)
-        expected_out, expected_lse = args["out"].clone(), lse.clone()
+        self._require_large_address_memory(batch * 128 * (768 + 512 * 2))
+        args = _make_qh128_case([65], stride=768)[0]
+        mla_decode_fwd(**args)
+        expected_out = args["o"].clone()
         q = torch.zeros((batch, 128, 768), dtype=args["q"].dtype, device="cuda")[
             ..., :576
         ]
         q[-1:].copy_(args["q"])
         out = torch.full((batch, 128, 512), 123, dtype=torch.bfloat16, device="cuda")
-        large_lse = torch.full((batch, 128), float("nan"), device="cuda")
         seq_lens = torch.zeros(batch, dtype=torch.int32, device="cuda")
         seq_lens[-1] = 65
         page_table = torch.full(
-            (batch, args["page_table"].shape[1]),
-            -1,
-            dtype=torch.int32,
-            device="cuda",
+            (batch, args["page_table"].shape[1]), -1, dtype=torch.int32, device="cuda"
         )
         page_table[-1:].copy_(args["page_table"])
-        args.update(seq_lens=seq_lens, page_table=page_table)
-        args.update(q=q, out=out)
-        mla_decode_fwd_qh128_asm(**args, lse=large_lse)
+        args.update(seq_lens=seq_lens, page_table=page_table, q=q, o=out)
+        mla_decode_fwd(**args)
         torch.testing.assert_close(out[-1:], expected_out, atol=0, rtol=0)
-        torch.testing.assert_close(large_lse[-1:], expected_lse, atol=0, rtol=0)
         for row in (0, 32768, 43691, batch - 2):
-            assert (out[row] == 0).all() and torch.isneginf(large_lse[row]).all()
+            assert (out[row] == 0).all()
 
     def test_kv_beyond_4gib(self):
         self._require_large_address_memory((1 << 32) + (1 << 20))
         case = _make_qh128_case([65, 129])
-        args, lse, *_ = case
+        args = case[0]
         offset = (1 << 32) // (64 * 576) + 128
         kv = torch.empty(
-            (offset + args["kv"].shape[0], 1, 64, 576),
-            dtype=args["kv"].dtype,
+            (offset + args["kv_buffer"].shape[0], 1, 64, 576),
+            dtype=args["kv_buffer"].dtype,
             device="cuda",
         )
-        # If a byte address wraps, it reads zeros instead of the selected KV.
         kv.view(-1)[: 1 << 20].zero_()
-        kv[offset:].copy_(args["kv"])
-        args["kv"] = kv
+        kv[offset:].copy_(args["kv_buffer"])
+        args["kv_buffer"] = kv
         args["page_table"] = args["page_table"] + offset
-        mla_decode_fwd_qh128_asm(**args, lse=lse)
-        _check_qh128_case(case)
+        _run_qh128_case(case)
 
     def test_page_table_beyond_4gib(self):
         self._require_large_address_memory((1 << 32) + 128)
         case = _make_qh128_case([65, 129])
-        args, lse, *_ = case
-        stride = (1 << 30) + 16  # int32 elements; row 1 starts beyond 4 GiB.
+        args = case[0]
+        stride = (1 << 30) + 16
         table = torch.empty_strided(
             args["page_table"].shape, (stride, 1), dtype=torch.int32, device="cuda"
         )
-        # Poison where row 1 would land if its byte offset wrapped at 32 bits.
         table.as_strided((args["page_table"].shape[1],), (1,), storage_offset=16).fill_(
             -1
         )
         table.copy_(args["page_table"])
         args["page_table"] = table
-        mla_decode_fwd_qh128_asm(**args, lse=lse)
-        _check_qh128_case(case)
+        _run_qh128_case(case)
 
 
 if __name__ == "__main__":
