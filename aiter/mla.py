@@ -14,7 +14,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
-from aiter.jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
+from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import (
     get_mla_decode_fwd_max_splits,
@@ -631,166 +631,66 @@ def mla_decode_fwd_ds32(
     return o, (final_lse if return_lse else None)
 
 
-def _mla_decode_fwd_kv_shuffled(
-    q,
-    kv_buffer,
-    o,
-    qo_indptr,
-    max_seqlen_q,
-    page_size,
-    nhead_kv,
-    sm_scale,
-    q_scale,
-    kv_scale,
-    seq_lens,
-    page_table,
-    num_kv_splits,
-    causal,
-):
+def mla_decode_fwd_qh128_asm(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode gfx1250 QH128 FP8 MLA with kv-shuffled page64 KV.
+
+    Q is [B,128,576] FP8 E4M3FN, with head stride 576 or 768 bytes, and one
+    query per sequence. Writes preallocated contiguous BF16 out[B,128,512]
+    and optional natural-log FP32 lse[B,128]. Returns out.
+
+    Contiguous FP8 KV is [physical_pages,1,64,576], with separate NoPE/RoPE
+    planes tiled into 16-token x 16-dimension blocks. Provide GPU int32
+    contiguous seq_lens[B] and page_table[B,max_pages] with unit inner stride.
+    Invalid lengths/page IDs produce O=0 and LSE=-inf; unused KV/page-table
+    padding may be poisoned.
+
+    The cache writer must produce the kv-shuffled layout; shapes cannot
+    verify its bytes. Segmented page64 KV is not supported. This entry point
+    does not repack KV or convert metadata.
+
+    q_scale and kv_scale are required GPU FP32 scalar tensors on Q's device.
+    For unit scales, create tensors containing 1.0 once during initialization,
+    before graph capture, and reuse them for each call. Used inputs/scales
+    must be finite. Empty sequences produce O=0, LSE=-inf. No split-K,
+    partial logits, or host metadata synchronization. Warm up the native
+    module on the target device before graph capture. The native launcher
+    uses the Q device's current stream. Callers manage tensor lifetimes
+    and dependencies across streams.
+    """
+    require_gfx1250_asm("mla_decode_fwd_qh128_asm")
     if seq_lens is None or page_table is None:
-        raise ValueError("kv_shuffled requires seq_lens and page_table")
-    tensors = (q, kv_buffer, o, seq_lens, page_table)
-    if not q.is_cuda or any(t.device != q.device for t in tensors):
-        raise ValueError("kv_shuffled tensors must be on the Q device")
-    if q.ndim != 3 or q.shape[-1] != 576 or q.stride(-1) != 1:
-        raise ValueError("Q must be [total_q, num_heads, 576]")
-    if o.shape != (*q.shape[:2], 512) or not o.is_contiguous():
-        raise ValueError("out must be contiguous [total_q, num_heads, 512]")
-    if q.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
-        raise ValueError("kv_shuffled requires FP8 or BF16 Q")
-    if kv_buffer.dtype not in (torch.float8_e4m3fn, torch.bfloat16):
-        raise ValueError("kv_shuffled requires FP8 or BF16 KV")
-    if o.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError("kv_shuffled requires a floating-point output")
-    if (
-        page_size != 64
-        or kv_buffer.ndim != 4
-        or kv_buffer.shape[1:] != (nhead_kv, 64, 576)
-        or kv_buffer.shape[0] == 0
-        or not kv_buffer.is_contiguous()
-        or nhead_kv <= 0
-        or q.shape[1] == 0
-        or q.shape[1] % nhead_kv
-    ):
+        raise ValueError("seq_lens and page_table are required")
+    if q_scale is None or kv_scale is None:
         raise ValueError(
-            "kv_shuffled requires KV [pages, nhead_kv, 64, 576] and page_size=64"
+            "q_scale and kv_scale are required; create and reuse FP32 [1] "
+            "tensors containing 1.0 for unit scales"
         )
-    if (
-        seq_lens.dtype != torch.int32
-        or seq_lens.ndim != 1
-        or not seq_lens.is_contiguous()
-    ):
-        raise ValueError("seq_lens must be contiguous int32 [B]")
-    batch = seq_lens.numel()
-    if (
-        page_table.dtype != torch.int32
-        or page_table.ndim != 2
-        or page_table.shape[0] != batch
-        or page_table.stride(1) != 1
-        or page_table.stride(0) <= 0
-        or page_table.shape[1] == 0
-    ):
-        raise ValueError(
-            "page_table must be int32 [B, max_pages] with unit inner stride"
-        )
-    if max_seqlen_q < 1 or q.shape[0] != batch * max_seqlen_q:
-        raise ValueError("kv_shuffled requires max_seqlen_q queries per sequence")
-    if qo_indptr is not None and (
-        qo_indptr.device != q.device
-        or qo_indptr.dtype != torch.int32
-        or qo_indptr.shape != (batch + 1,)
-        or not qo_indptr.is_contiguous()
-    ):
-        raise ValueError("qo_indptr must be contiguous int32 [B+1] on the Q device")
-    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
-        if scale is not None and (
-            scale.device != q.device
-            or scale.dtype != torch.float32
-            or scale.numel() != 1
-            or not scale.is_contiguous()
-        ):
-            raise ValueError(f"{name} must contain one GPU FP32 scalar on the Q device")
-    if batch == 0:
-        return o, None
-    if sm_scale is None:
-        sm_scale = 576**-0.5
-
-    use_qh128_asm = (
-        get_gfx() == "gfx1250"
-        and is_gfx1250_asm_supported()
-        and max_seqlen_q == 1
-        and q.shape[1] == 128
-        and nhead_kv == 1
-        and q.dtype == torch.float8_e4m3fn
-        and kv_buffer.dtype == torch.float8_e4m3fn
-        and o.dtype == torch.bfloat16
-        and q.stride(2) == 1
-        and q.stride(1) in (576, 768)
-        and q.stride(0) == 128 * q.stride(1)
-        and q_scale is not None
-        and kv_scale is not None
-        and num_kv_splits in (None, 1)
-        and batch < (1 << 32) // (128 * 4)
-        and kv_buffer.shape[0] <= (1 << 31) - 1
-        and page_table.shape[1] < (1 << 25)
-        and batch * page_table.stride(0) <= (1 << 32) - 1
+    mla_ps64_qh128_fp8_asm_fwd(
+        q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, float(softmax_scale)
     )
-    if use_qh128_asm:
-        mla_ps64_qh128_fp8_asm_fwd(
-            q,
-            kv_buffer,
-            seq_lens,
-            page_table,
-            o,
-            None,
-            q_scale,
-            kv_scale,
-            float(sm_scale),
-        )
-    else:
-        if not causal and max_seqlen_q != 1:
-            raise ValueError(
-                "kv_shuffled fallback supports only causal multi-query attention"
-            )
-        from aiter.ops.triton.attention.mla import mla_decode_fwd as shuffled_decode
-
-        if qo_indptr is None:
-            qo_indptr = (
-                torch.arange(batch + 1, dtype=torch.int32, device=q.device)
-                * max_seqlen_q
-            )
-        shuffled_decode(
-            q,
-            kv_buffer,
-            o,
-            qo_indptr,
-            seq_lens,
-            page_table.shape[1] * page_size,
-            page_table,
-            sm_scale,
-            512,
-            64,
-            True,
-            q_scale,
-            kv_scale,
-            shuffled_kv_cache=True,
-        )
-        # The existing fallback may leave empty queries unwritten.
-        query_tail = torch.arange(max_seqlen_q - 1, -1, -1, device=q.device)
-        empty = (seq_lens[:, None] <= query_tail[None, :]).reshape(-1)
-        o.masked_fill_(empty[:, None, None], 0)
-    return o, None
+    return out
 
 
 def mla_decode_fwd(
     q,
     kv_buffer,
     o,
-    qo_indptr=None,
-    kv_indptr=None,
-    kv_indices=None,
-    kv_last_page_lens=None,
-    max_seqlen_q=1,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
     page_size=1,
     nhead_kv=1,
     sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
@@ -817,75 +717,9 @@ def mla_decode_fwd(
     cp_world_size=1,
     cp_rank=0,
     causal=True,
-    kv_layout="token_major",
-    seq_lens=None,
-    page_table=None,
 ):
-    """Decode MLA using the declared KV layout.
-
-    ``token_major`` preserves the existing dispatch and metadata contract,
-    including the legacy segmented page64 cache. ``kv_shuffled`` declares
-    [pages, nhead_kv, 64, 576] KV with separate NoPE/RoPE planes (FP8 uses
-    16-token x 16-dimension tiles). Supply GPU int32 seq_lens[B] and
-    page_table[B, max_pages]; CSR KV metadata is unused in this layout.
-
-    Kv-shuffled selects gfx1250 QH128 ASM for single-query FP8 Q/KV, BF16
-    output, explicit scalar scales and compatible strides. Other dense cases
-    use the existing Triton/Gluon shuffle implementation. Missing scales mean
-    unit scales on that fallback. The cache writer owns the byte layout;
-    this function does not repack KV. Kv-shuffled returns (o, None) and does
-    not support return_lse=True.
-
-    Kv-shuffled requires a uniform max_seqlen_q queries per sequence. If
-    qo_indptr is supplied, its contents must describe those query ranges.
-    Warm up before graph capture; no KV metadata is copied to the host.
-    CP/DCP, sparse/persistent work metadata and partial logits are unsupported
-    for kv-shuffled. The default layout keeps their existing behavior.
-    """
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
-    if kv_layout not in ("token_major", "kv_shuffled"):
-        raise ValueError("kv_layout must be 'token_major' or 'kv_shuffled'")
-    if kv_layout == "kv_shuffled":
-        if return_lse:
-            raise ValueError("kv_shuffled does not support return_lse=True")
-        if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
-            raise ValueError("kv_shuffled does not support CP/DCP")
-        if intra_batch_mode or any(
-            meta is not None
-            for meta in (
-                num_kv_splits_indptr,
-                work_meta_data,
-                work_indptr,
-                work_info_set,
-                reduce_indptr,
-                reduce_final_map,
-                reduce_partial_map,
-            )
-        ):
-            raise ValueError(
-                "kv_shuffled does not support sparse/persistent work metadata"
-            )
-        if return_logits:
-            raise ValueError("kv_shuffled does not support partial logits")
-        return _mla_decode_fwd_kv_shuffled(
-            q,
-            kv_buffer,
-            o,
-            qo_indptr,
-            max_seqlen_q,
-            page_size,
-            nhead_kv,
-            sm_scale,
-            q_scale,
-            kv_scale,
-            seq_lens,
-            page_table,
-            num_kv_splits,
-            causal,
-        )
-    if seq_lens is not None or page_table is not None:
-        raise ValueError("seq_lens and page_table require kv_layout='kv_shuffled'")
     if kv_buffer.dtype != torch.uint8:
         _, _, _, qk_head_dim = kv_buffer.shape
     else:

@@ -1822,10 +1822,6 @@ def _mla_decode_fwd_kernel(
         + 1
     )
     max_seq_prefix_len = gl.minimum(max_seq_prefix_len, seq_len)
-    # The reducer masks segments beyond this query block's causal prefix.
-    # Avoid entering the pipelined loop with an empty tile range.
-    if segm_idx * tiles_per_segment * TILE_SIZE >= max_seq_prefix_len:
-        return
 
     pgm: MLAProgram = MLAProgram.initialize(
         cfg,
