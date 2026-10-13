@@ -17,7 +17,10 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.attention import get_mla_decode_fwd_max_splits, mla_decode_v3_asm_fwd
+from aiter.ops.attention import (
+    get_mla_decode_fwd_max_splits,
+    mla_ps64_qh128_fp8_asm_fwd,
+)
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -763,19 +766,31 @@ def mla_decode_fwd_qh128_asm(
             raise ValueError(f"{name} must be a GPU FP32 scalar on the Q device")
     if not math.isfinite(softmax_scale):
         raise ValueError("softmax_scale must be finite")
-    mla_decode_v3_asm_fwd(
-        q,
-        kv,
-        out,
-        q_scale,
-        kv_scale,
-        float(softmax_scale),
-        kv_layout=1,
-        seq_lens=seq_lens,
-        page_table=page_table,
-        lse=lse,
+    mla_ps64_qh128_fp8_asm_fwd(
+        q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, float(softmax_scale)
     )
     return out
+
+
+def _mla_decode_fwd_kv_shuffled(
+    q, kv, o, seq_lens, page_table, sm_scale, q_scale, kv_scale, return_lse
+):
+    require_gfx1250_asm("mla_ps64_qh128_fp8_asm_fwd")
+    _check_mla_qh128_inputs(q, kv, o, seq_lens, page_table, None)
+    q_scale = _mla_scale_on_device(q_scale, q, "q_scale")
+    kv_scale = _mla_scale_on_device(kv_scale, q, "kv_scale")
+    final_lse = (
+        torch.empty((q.shape[0], 128), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    softmax_scale = 576**-0.5 if sm_scale is None else float(sm_scale)
+    if not math.isfinite(softmax_scale):
+        raise ValueError("softmax_scale must be finite")
+    mla_ps64_qh128_fp8_asm_fwd(
+        q, kv, seq_lens, page_table, o, final_lse, q_scale, kv_scale, softmax_scale
+    )
+    return o, final_lse
 
 
 def mla_decode_fwd(
@@ -863,31 +878,17 @@ def mla_decode_fwd(
             raise ValueError(
                 "kv_shuffled MLA ASM does not use split/persistent metadata"
             )
-        require_gfx1250_asm("mla_decode_v3_asm_fwd")
-        _check_mla_qh128_inputs(q, kv_buffer, o, seq_lens, page_table, None)
-        q_scale = _mla_scale_on_device(q_scale, q, "q_scale")
-        kv_scale = _mla_scale_on_device(kv_scale, q, "kv_scale")
-        final_lse = (
-            torch.empty((q.shape[0], 128), dtype=torch.float32, device=q.device)
-            if return_lse
-            else None
-        )
-        softmax_scale = 576**-0.5 if sm_scale is None else float(sm_scale)
-        if not math.isfinite(softmax_scale):
-            raise ValueError("softmax_scale must be finite")
-        mla_decode_v3_asm_fwd(
+        return _mla_decode_fwd_kv_shuffled(
             q,
             kv_buffer,
             o,
+            seq_lens,
+            page_table,
+            sm_scale,
             q_scale,
             kv_scale,
-            softmax_scale,
-            kv_layout=1,
-            seq_lens=seq_lens,
-            page_table=page_table,
-            lse=final_lse,
+            return_lse,
         )
-        return o, final_lse
     if kv_layout != "token_major":
         raise ValueError(f"unknown MLA kv_layout: {kv_layout!r}")
 
@@ -1001,57 +1002,34 @@ def mla_decode_fwd(
         use_valid_split_count_reduce = int(num_kv_splits > 1)
 
         require_gfx1250_asm("mla_decode_stage1_asm_fwd")
-        if get_gfx() == "gfx1250":
-            mla_decode_v3_asm_fwd(
-                q,
-                kv_buffer,
-                o,
-                q_scale,
-                kv_scale,
-                sm_scale,
-                kv_layout=0,
-                page_size=page_size,
-                max_seqlen_q=max_seqlen_q,
-                nhead_kv=nhead_kv,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_page_indices=kv_indices,
-                kv_last_page_lens=kv_last_page_lens,
-                num_kv_splits_indptr=num_kv_splits_indptr,
-                split_data=logits,
-                split_lse=attn_lse,
-                valid_split_count=valid_split_count,
-                lse=final_lse,
-            )
-        else:
-            aiter.mla_decode_stage1_asm_fwd(
-                q,
-                kv_buffer,
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_last_page_lens,
-                num_kv_splits_indptr,
-                None,
-                None,
-                None,
-                max_seqlen_q,
-                page_size,
-                nhead_kv,
-                sm_scale,
-                logits,
-                attn_lse,
-                o,
-                final_lse,
-                q_scale,
-                kv_scale,
-                g_kv_indptr,
-                cp_world_size,
-                cp_rank,
-                valid_split_count,
-                use_valid_split_count_reduce,
-                causal,
-            )
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr,
+            None,
+            None,
+            None,
+            max_seqlen_q,
+            page_size,
+            nhead_kv,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+            final_lse,
+            q_scale,
+            kv_scale,
+            g_kv_indptr,
+            cp_world_size,
+            cp_rank,
+            valid_split_count,
+            use_valid_split_count_reduce,
+            causal,
+        )
 
         if num_kv_splits == 1 and (
             q.dtype == dtypes.fp8

@@ -1,8 +1,9 @@
 # gfx1250 MLA v3 ASM decode
 
 Frameworks call `aiter.mla.mla_decode_fwd` and select the KV byte layout with
-`kv_layout`. Both gfx1250 page64 paths launch through
-`aiter.ops.attention.mla_decode_v3_asm_fwd` in `module_mla_asm`.
+`kv_layout`. Each layout keeps its own native launcher in `module_mla_asm`:
+`token_major` uses the existing `mla_decode_stage1_asm_fwd` dispatch and
+`kv_shuffled` uses `mla_ps64_qh128_fp8_asm_fwd`.
 
 | `kv_layout` | Query heads / queries per sequence | KV storage | Metadata | Scheduling |
 | --- | --- | --- | --- | --- |
@@ -71,18 +72,17 @@ parallelism, persistent metadata, KV splitting, and partial-logit requests are
 rejected. This branch does not fall back to Triton/Gluon. Used Q/KV values and
 GPU scales must be finite.
 
-## Native launcher and compatibility
+## Native launchers and compatibility
 
-The native `mla_decode_v3_asm_fwd` uses `kv_layout=0` for the existing segmented
-120-byte ABI and `kv_layout=1` for the shuffled 88-byte ABI. Query heads and query
-length select a kernel from the existing manifest within the chosen ABI. It
-does not allocate workspaces or convert metadata. Segmented calls still need
-the existing split buffers and stage-2 reducer for multiple splits.
+The two layouts take disjoint metadata (page-level CSR plus split workspaces
+versus dense `seq_lens`/`page_table`), so each keeps a launcher whose signature
+holds only its own arguments. `mla_decode_fwd` validates and routes in Python;
+the `token_major` path is unchanged. `mla_ps64_qh128_fp8_asm_fwd` launches the
+shuffled 88-byte ABI and does not allocate workspaces or convert metadata.
 
-The previous `mla_decode_fwd_qh128_asm` convenience function remains available
-for callers with preallocated O/LSE and explicit GPU scales, and now uses the
-unified launcher. Existing low-level native symbols remain available. Kernel
-code objects and their ABI layouts are unchanged.
+`mla_decode_fwd_qh128_asm` remains available for callers with preallocated
+O/LSE and explicit GPU scales. Kernel code objects and their ABI layouts are
+unchanged.
 
 The page64 benchmark also calls `mla_decode_fwd` for both layouts. Its CLI
 defaults to shuffled for QH128 and segmented for other supported head counts;

@@ -786,38 +786,6 @@ MD_NAME = "module_mla_asm"
 
 
 @compile_ops(MD_NAME, ffi_type="ctypes")
-def mla_decode_v3_asm_fwd(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    out: torch.Tensor,
-    q_scale: torch.Tensor,
-    kv_scale: torch.Tensor,
-    softmax_scale: float,
-    kv_layout: int,  # 0: legacy segmented PS64; 1: kv-shuffled PS64
-    page_size: int = 64,
-    max_seqlen_q: int = 1,
-    nhead_kv: int = 1,
-    seq_lens: torch.Tensor | None = None,
-    page_table: torch.Tensor | None = None,
-    qo_indptr: torch.Tensor | None = None,
-    kv_indptr: torch.Tensor | None = None,
-    kv_page_indices: torch.Tensor | None = None,
-    kv_last_page_lens: torch.Tensor | None = None,
-    num_kv_splits_indptr: torch.Tensor | None = None,
-    split_data: torch.Tensor | None = None,
-    split_lse: torch.Tensor | None = None,
-    valid_split_count: torch.Tensor | None = None,
-    lse: torch.Tensor | None = None,
-) -> None:
-    """gfx1250 MLA v3 launch; callers supply the selected layout's metadata.
-
-    Segmented KV uses CSR and split workspaces; shuffled KV uses dense lengths
-    and a page table and writes final O/LSE. No layout or metadata conversion.
-    The segmented caller reduces FP32 partials when split_data.size(1) > 1.
-    """
-
-
-@compile_ops(MD_NAME, ffi_type="ctypes")
 def mla_ps64_qh128_fp8_asm_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,

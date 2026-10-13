@@ -1218,7 +1218,7 @@ class TestMlaV3Unified:
         def unexpected_launch(*args, **kwargs):
             pytest.fail("unsupported inputs reached the native launcher")
 
-        monkeypatch.setattr(aiter.mla, "mla_decode_v3_asm_fwd", unexpected_launch)
+        monkeypatch.setattr(aiter.mla, "mla_ps64_qh128_fp8_asm_fwd", unexpected_launch)
         with pytest.raises((ValueError, RuntimeError), match=message):
             _run_atom_shuffled(args, **overrides)
 
@@ -1247,7 +1247,7 @@ class TestMlaV3Unified:
         def unexpected_launch(*args, **kwargs):
             pytest.fail("invalid tensors reached the native launcher")
 
-        monkeypatch.setattr(aiter.mla, "mla_decode_v3_asm_fwd", unexpected_launch)
+        monkeypatch.setattr(aiter.mla, "mla_ps64_qh128_fp8_asm_fwd", unexpected_launch)
         with pytest.raises((ValueError, RuntimeError), match=message):
             _run_atom_shuffled(args, **{field: invalid[field]})
 
